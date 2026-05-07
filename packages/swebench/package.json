@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@opencode-ai/swebench",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "description": "Run opencode against SWE-bench instances and produce predictions.jsonl",
+  "bin": {
+    "opencode-swebench": "./bin/opencode-swebench"
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@tsconfig/bun": "catalog:",
+    "@types/bun": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "typescript": "catalog:"
+  }
+}
