@@ -8,8 +8,8 @@
  *     Submitted: 3   astropy__astropy-12907, marshmallow-code__marshmallow-1359, ...
  *     TimeoutError: 2   sqlfluff__sqlfluff-1517, sqlfluff__sqlfluff-1625
  *   ─ Active workers ───────────────────────────────────────────────────────────
- *     ⠙ django__django-10914 [3/10]    step 5  tool=read $0.0123
- *     ⠹ pvlib__pvlib-python-1072 [4/10] step 2  tool=bash $0.0056
+ *     ⠙ django__django-10914  step 5  $0.0123  0:42
+ *     ⠹ pvlib__pvlib-python-1072  step 2  $0.0056  0:21
  *
  * Usage:
  *
@@ -182,7 +182,7 @@ export class BatchProgressManager {
         const frame = SPINNER[(this.spinnerFrame + e.idx) % SPINNER.length]
         lines.push(
           truncate(
-            `    ${frame} ${id} [${e.idx}/${this.total}]  ${e.status}  ${fmt(dur)}`,
+            `    ${frame} ${id}  ${e.status}  ${fmt(dur)}`,
             cols,
           ),
         )

@@ -85,6 +85,8 @@ interface Args {
   thinking?: boolean
   quiet?: boolean
   progress?: boolean
+  container?: boolean
+  containerImage?: string
 }
 
 function usage(): never {
@@ -163,6 +165,18 @@ Execution:
   --agent <name>             opencode primary agent. Default: build
   --no-keep-workspaces       Delete workspaces after completion (not yet implemented).
 
+Container (mini-swe-agent parity):
+  --container                Run every agent shell command inside the official
+                             SWE-bench eval image for the instance, instead of on
+                             the host. The host worktree is bind-mounted into the
+                             container so opencode's file tools and the final
+                             git diff still operate on local files. Requires a
+                             docker- or podman-compatible CLI on PATH. Default: off.
+  --container-image <tmpl>   Image name template. Supports {instance} (normalized
+                             id, '__'->'_1776_', lowercased) and {instance_id}
+                             (raw id). Default:
+                                 swebench/sweb.eval.x86_64.{instance}:latest
+
 Output:
   --traj-dir <dir>           Root directory for per-instance trajectory files.
                              Each instance is written to
@@ -170,11 +184,12 @@ Output:
                              (mini-swe-agent layout). Default: ./trajectories.
                              Pass --traj-dir "" to disable.
   --verbose, -v              Stream the agent <-> LLM interaction live to stdout
-                             (default: ON).
+                             (default: OFF; quiet is the default).
   --thinking                 Also stream the model's reasoning blocks. Implies
                              --verbose.
   --quiet, -q                Only print the per-instance "done" summary line
-                             (suppresses the live progress messages).
+                             (suppresses the live progress messages). This is
+                             the default; pass --verbose to opt back in.
   --progress / --no-progress Enable / disable the live mini-style progress bar
                              at the bottom of stderr. Default: ON when stderr
                              is a TTY and --verbose is off.
@@ -203,6 +218,10 @@ Examples:
   # Force re-run
   opencode-swebench --subset lite --output ./preds.json --model openai/gpt-4o \\
       --redo-existing
+
+  # Run agent shell commands inside the official SWE-bench eval containers
+  opencode-swebench --subset lite --slice 0:10 --workers 4 --container \\
+      --output ./preds.json --model openai/gpt-4o
 `)
   process.exit(1)
 }
@@ -349,6 +368,13 @@ function parseArgs(argv: string[]): Args {
       case "--no-progress":
         out.progress = false
         break
+      case "--container":
+        out.container = true
+        break
+      case "--container-image":
+        out.containerImage = need(i, a)
+        i++
+        break
       default:
         console.error(`Unknown argument: ${a}`)
         usage()
@@ -442,13 +468,15 @@ async function main() {
     opencodeBin: args.opencodeBin ?? process.env.OPENCODE_SWEBENCH_BIN,
     opencodeCwd: args.opencodeCwd ?? process.env.OPENCODE_SWEBENCH_CWD,
     trajDir: resolveTrajDir(args.trajDir),
-    verbose: args.quiet ? false : (args.verbose ?? true),
-    thinking: args.quiet ? false : (args.thinking ?? false),
+    verbose: args.verbose ?? false,
+    thinking: args.thinking ?? false,
     progress: args.progress,
     agent: args.agent,
     concurrency: args.concurrency,
     timeoutMs: args.timeoutMs,
     keepWorkspaces: args.keepWorkspaces,
+    container: args.container,
+    containerImageTemplate: args.containerImage,
   })
 
   const failed = results.filter((r) => r.status === "error" || r.status === "timeout").length

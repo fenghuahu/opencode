@@ -79,6 +79,54 @@ so the same workflow works with anything that speaks the OpenAI Chat
 Completions API. Override the implementation package with `--provider-npm`
 if you need a different ai-sdk adapter.
 
+## Container mode (mini-swe-agent parity)
+
+By default the agent runs `bash` commands on the host. Pass `--container` to
+run every agent shell command **inside the official SWE-bench eval image** for
+that instance (the same image the harness uses, and the same environment
+mini-swe-agent runs in), while opencode's file tools (`read`/`edit`/`grep`)
+and the final `git diff` keep operating on local files.
+
+```bash
+bun packages/swebench/bin/opencode-swebench \
+  --instances ./swebench_lite.jsonl --output ./predictions.jsonl \
+  --model openai/gpt-4o \
+  --container
+```
+
+This requires a `docker`- or `podman`-compatible CLI on `PATH`. Override the
+image name with `--container-image <tmpl>`; the template supports `{instance}`
+(normalized id: `__`->`_1776_`, lowercased) and `{instance_id}` (raw id):
+
+```bash
+  --container-image 'docker.io/swebench/sweb.eval.x86_64.{instance}:latest'
+```
+
+### How container mode works
+
+No opencode core changes are required — it reuses opencode's `config.shell`
+option. For each instance the runner:
+
+1. Pulls the eval image if it is not already present locally.
+2. Starts the image, checks out `base_commit` in `/testbed`, and `docker cp`s
+   the image's built `/testbed` (including `.git` and any compiled artifacts /
+   editable install) onto the host worktree.
+3. Re-runs the container with the host worktree **bind-mounted over**
+   `/testbed`, so edits made by opencode's file tools are visible inside the
+   container and vice-versa.
+4. Injects a small POSIX-sh wrapper as `config.shell`. opencode invokes the
+   bash tool as `<wrapper> -c "<command>"`; the wrapper translates the current
+   working directory from the host path to the container's `/testbed` path and
+   runs `docker exec -w <path> <container> /bin/bash -c "<command>"`.
+5. Tears the container down after the instance finishes (and force-removes any
+   strays at the end of the run).
+
+Because the bind mount copies the image's pre-built `/testbed` to the host
+first, the compiled artifacts / editable install from the eval image are
+preserved. This is faithful for SWE-bench Lite (mostly pure Python). Instances
+that depend on absolute container build paths baked outside `/testbed` may need
+extra care.
+
 ## How it works
 
 For each SWE-bench instance the runner:
@@ -104,3 +152,6 @@ For each SWE-bench instance the runner:
   cannot escape it without the `external_directory` permission (denied here).
 - Use `--keep-workspaces` to preserve clones for inspection. By default
   workspaces are kept (cloning is the expensive step) and you can re-run.
+- With `--container`, agent `bash` commands run inside the official eval image
+  instead of on the host (see "Container mode" above); file tools and the final
+  `git diff` still operate on the host worktree.

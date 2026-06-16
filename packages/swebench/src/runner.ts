@@ -7,6 +7,7 @@ import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2"
 import { diffSinceBase, ensureRepo } from "./git.ts"
 import { defaultPrompt } from "./prompt.ts"
 import { spawnServer } from "./spawnServer.ts"
+import { ContainerManager, dockerAvailable } from "./container.ts"
 import { TrajectoryWriter } from "./trajectory.ts"
 import { ProgressPrinter } from "./progress.ts"
 import { BatchProgressManager } from "./batchProgress.ts"
@@ -275,6 +276,9 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
     enabled: wantsProgress,
   })
   const log = bpm.wrapLog()
+  // Verbose-only line: per-instance setup chatter. In quiet mode (default) only
+  // the final `done` summary line survives.
+  const vlog = options.verbose ? log : (_: string) => {}
   bpm.start()
 
   log(
@@ -295,6 +299,28 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
     ...(options.provider
       ? { provider: buildProviderConfig(options.provider, parsed.modelID) }
       : {}),
+  }
+
+  // Container mode (mini-swe-agent parity): route every agent shell command
+  // into the official SWE-bench eval image. We point opencode's `shell` config
+  // at a wrapper that forwards commands into per-instance containers; file tools
+  // and `git diff` keep operating on the bind-mounted host worktree.
+  let containers: ContainerManager | undefined
+  if (options.container) {
+    if (!(await dockerAvailable())) {
+      throw new Error(
+        "--container requires a docker/podman-compatible CLI on PATH, but none was found.",
+      )
+    }
+    containers = new ContainerManager({
+      workspaceRoot: options.workspaceRoot,
+      imageTemplate: options.containerImageTemplate,
+      log,
+    })
+    const { shellPath } = await containers.init()
+    ;(config as Record<string, unknown>).shell = shellPath
+    log(`> container mode: agent shell commands run inside SWE-bench eval images`)
+    log(`> container shell wrapper -> ${shellPath}`)
   }
 
   const command = options.opencodeBin ?? defaultOpencodeBin().command
@@ -386,17 +412,29 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
       const tag = `[${instance.instance_id} ${idx + 1}/${total}]`
       bpm.onStart(instance.instance_id, idx + 1)
       const status = (s: string) => bpm.onUpdate(instance.instance_id, s)
+      let container: Awaited<ReturnType<ContainerManager["prepare"]>> | undefined
       try {
         status("preparing repo")
-        log(`${tag} preparing repo ${instance.repo}@${instance.base_commit.slice(0, 12)}`)
-        const repoDir = await ensureRepo({
-          workspaceRoot: options.workspaceRoot,
-          instanceId: instance.instance_id,
-          repo: instance.repo,
-          baseCommit: instance.base_commit,
-        })
+        vlog(`${tag} preparing repo ${instance.repo}@${instance.base_commit.slice(0, 12)}`)
+        let repoDir: string
+        if (containers) {
+          status("starting container")
+          vlog(`${tag} starting container`)
+          container = await containers.prepare(
+            instance,
+            path.join(options.workspaceRoot, instance.instance_id),
+          )
+          repoDir = container.repoDir
+        } else {
+          repoDir = await ensureRepo({
+            workspaceRoot: options.workspaceRoot,
+            instanceId: instance.instance_id,
+            repo: instance.repo,
+            baseCommit: instance.base_commit,
+          })
+        }
 
-        log(`${tag} running agent (timeout=${options.timeoutMs}ms)`)
+        vlog(`${tag} running agent (timeout=${options.timeoutMs}ms)`)
         status("starting session")
         const promptText = prompt(instance, repoDir)
         const traj = options.trajDir
@@ -409,7 +447,7 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
               prompt: promptText,
             })
           : undefined
-        if (traj) log(`${tag} trajectory -> ${traj.path}`)
+        if (traj) vlog(`${tag} trajectory -> ${traj.path}`)
 
         const progress = new ProgressPrinter({
           tag,
@@ -471,10 +509,13 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
           duration_ms: 0,
           error: err,
         })
+      } finally {
+        if (container) await container.stop().catch(() => {})
       }
     })
   } finally {
     server.close()
+    if (containers) await containers.stopAll().catch(() => {})
     bpm.stop()
   }
 

@@ -83,13 +83,22 @@ export class ProgressPrinter {
 
   constructor(private opts: ProgressOptions) {}
 
+  /** Compact widget status: only step count + running total cost. */
+  private statusLine(): string {
+    return `step ${this.steps}  $${this.totalCost.toFixed(4)}`
+  }
+
   /** Render a part. Called from the runner's event loop. */
   render(part: any) {
-    const { tag, log, verbose, thinking } = this.opts
+    const { tag, verbose, thinking } = this.opts
+    // In quiet mode (verbose off) we still track totals + drive the live batch
+    // widget via onStatus, but emit no per-step scroll-back lines. `log` is a
+    // no-op so a single guard keeps the accounting paths intact.
+    const log = verbose ? this.opts.log : (_: string) => {}
 
     if (part.type === "step-start") {
       this.steps++
-      this.opts.onStatus?.(`step ${this.steps}`)
+      this.opts.onStatus?.(this.statusLine())
       log(`${tag} ${ICONS.step} step ${this.steps} start`)
       return
     }
@@ -103,9 +112,7 @@ export class ProgressPrinter {
       this.totalIn += tin
       this.totalOut += tout
       this.totalReasoning += treason
-      this.opts.onStatus?.(
-        `step ${this.steps} done  in:${tin} out:${tout}  $${this.totalCost.toFixed(4)}`,
-      )
+      this.opts.onStatus?.(this.statusLine())
       log(
         `${tag} ${ICONS.done} step ${this.steps} finish reason=${part.reason} ` +
           `tokens=in:${tin} out:${tout} reason:${treason} cost=$${cost.toFixed(4)} ` +
@@ -142,7 +149,7 @@ export class ProgressPrinter {
         this.toolStarts.set(part.id, Date.now())
         const icon = (ICONS as any)[part.tool] ?? ICONS.generic
         const desc = prettyInput(part.tool, s.input)
-        this.opts.onStatus?.(`step ${this.steps} ${part.tool} ${desc}`.trim())
+        this.opts.onStatus?.(this.statusLine())
         log(`${tag} ${icon} ${part.tool} ${desc}`)
         return
       }
@@ -183,7 +190,9 @@ export class ProgressPrinter {
 
   /** Print a final summary line. Called once after the session goes idle. */
   summary() {
-    const { tag, log } = this.opts
+    const { tag } = this.opts
+    if (!this.opts.verbose) return
+    const log = this.opts.log
     log(
       `${tag} ${ICONS.cost} totals: steps=${this.steps} ` +
         `tokens=in:${this.totalIn} out:${this.totalOut} reason:${this.totalReasoning} ` +

@@ -100,6 +100,20 @@ export interface RunOptions {
   concurrency: number
   timeoutMs: number
   keepWorkspaces: boolean
+  /**
+   * Run every agent shell command inside the official SWE-bench eval container
+   * for the instance (mini-swe-agent parity). The host worktree is bind-mounted
+   * into the container so opencode's file tools and the final `git diff` still
+   * operate on local files. Requires a docker/podman-compatible CLI. Default:
+   * false (commands run on the host).
+   */
+  container?: boolean
+  /**
+   * Image name template for container mode. Supports `{instance}` (normalized
+   * instance id, `__`→`_1776_`, lowercased) and `{instance_id}` (raw id).
+   * Default: `swebench/sweb.eval.x86_64.{instance}:latest`.
+   */
+  containerImageTemplate?: string
   /** Override the system / instructions appended to the user prompt. */
   promptTemplate?: (instance: SweBenchInstance, repoDir: string) => string
   /** Logger; defaults to console. */
