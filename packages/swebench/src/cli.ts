@@ -9,6 +9,7 @@ import {
   readExistingInstanceIds,
 } from "./dataset.ts"
 import type { SweBenchInstance } from "./types.ts"
+import { loadPriceTable, lookupPrice, type ModelPrice } from "./pricing.ts"
 
 /**
  * Bun 1.3 caches HTTP proxy configuration at process startup, so neither
@@ -78,6 +79,11 @@ interface Args {
   apiKey?: string
   providerId?: string
   providerNpm?: string
+  priceTable?: string
+  costInput?: number
+  costOutput?: number
+  costCacheRead?: number
+  costCacheWrite?: number
   opencodeBin?: string
   opencodeCwd?: string
   trajDir?: string
@@ -147,6 +153,24 @@ Provider:
                              Default: min(8192, model-context/4) when only
                              --model-context is given. Example: --model-output 4096
 
+Cost (litellm-style pricing):
+  --price-table <path|url>   litellm price table to resolve the model's price
+                             from. Accepts a local JSON file or URL. Default:
+                             litellm's model_prices_and_context_window.json on
+                             GitHub. The looked-up price is handed to opencode
+                             so cost is computed natively (input*tokens/1e6 ...).
+  --cost-input <usd/1M>      Override input price in USD per 1M tokens. Use this
+                             for self-hosted models not in the litellm table
+                             (e.g. vLLM). Example: --cost-input 0.5
+  --cost-output <usd/1M>     Override output price in USD per 1M tokens.
+                             Example: --cost-output 1.5
+  --cost-cache-read <usd/1M> Override cached-input (read) price per 1M tokens.
+  --cost-cache-write <usd/1M> Override cache-write price per 1M tokens.
+  (env) LITELLM_LOCAL_MODEL_COST_MAP=True
+                             Skip the network and read only the price table
+                             bundled inside the installed litellm package
+                             (same env var litellm / mini-swe-agent honour).
+
 opencode server:
   --opencode-bin <cmd>       Command used to launch "opencode serve". Default: "opencode"
                              from PATH. Set this when your installed opencode is older
@@ -198,6 +222,9 @@ Output:
 Environment:
   Provider credentials for built-in providers (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...).
   OPENCODE_SWEBENCH_API_KEY  Fallback for --api-key when using --base-url.
+  LITELLM_LOCAL_MODEL_COST_MAP=True
+                             Force local-only pricing (use the litellm package's
+                             bundled price table, never the network).
 
 Examples:
   # SWE-bench Lite, first 10 instances, 4 workers, against a local vLLM
@@ -338,6 +365,26 @@ function parseArgs(argv: string[]): Args {
         out.providerNpm = need(i, a)
         i++
         break
+      case "--price-table":
+        out.priceTable = need(i, a)
+        i++
+        break
+      case "--cost-input":
+        out.costInput = Number(need(i, a))
+        i++
+        break
+      case "--cost-output":
+        out.costOutput = Number(need(i, a))
+        i++
+        break
+      case "--cost-cache-read":
+        out.costCacheRead = Number(need(i, a))
+        i++
+        break
+      case "--cost-cache-write":
+        out.costCacheWrite = Number(need(i, a))
+        i++
+        break
       case "--opencode-bin":
         out.opencodeBin = need(i, a)
         i++
@@ -402,6 +449,40 @@ function resolveTrajDir(value: string | undefined): string | undefined {
   return path.resolve("trajectories")
 }
 
+/**
+ * Resolve the model price (USD per 1M tokens) litellm-style: explicit
+ * --cost-* overrides win; otherwise look the model up in the litellm price
+ * table. Returns undefined (cost stays 0) when nothing matches.
+ */
+async function resolveCost(args: Args, log: (s: string) => void): Promise<ModelPrice | undefined> {
+  if (args.costInput != null || args.costOutput != null) {
+    log(`> pricing: manual override input=$${args.costInput ?? 0}/1M output=$${args.costOutput ?? 0}/1M`)
+    return {
+      input: args.costInput ?? 0,
+      output: args.costOutput ?? 0,
+      ...(args.costCacheRead != null ? { cache_read: args.costCacheRead } : {}),
+      ...(args.costCacheWrite != null ? { cache_write: args.costCacheWrite } : {}),
+    }
+  }
+  try {
+    const table = await loadPriceTable(args.priceTable)
+    // litellm keys are often "<provider>/<model>" (e.g. "openai/Qwen3-235B-A22B-FP8").
+    // Try the provider-id-prefixed id first so it can match those keys, then
+    // fall back to the bare model id. lookupPrice strips prefixes from most to
+    // least specific, so the combined form covers both cases.
+    const combined = args.providerId ? `${args.providerId}/${args.model}` : args.model
+    const price = lookupPrice(table, combined) ?? lookupPrice(table, args.model)
+    if (price) {
+      log(`> pricing: ${combined} -> input=$${price.input}/1M output=$${price.output}/1M (litellm)`)
+      return price
+    }
+    log(`> WARNING: pricing: "${combined}" not found in price table; cost will be $0 (pass --cost-input/--cost-output)`)
+  } catch (e) {
+    log(`> WARNING: pricing: could not load price table: ${(e as Error).message}; cost will be $0 (pass --cost-input/--cost-output or set LITELLM_LOCAL_MODEL_COST_MAP=True)`)
+  }
+  return undefined
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   const log = (s: string) => console.log(s)
@@ -444,11 +525,12 @@ async function main() {
     process.exit(0)
   }
 
-  const provider = (() => {
+  const provider = await (async () => {
     if (!args.baseUrl) return undefined
     const apiKey = args.apiKey ?? process.env.OPENCODE_SWEBENCH_API_KEY
     const ctx = args.modelContext
     const out = args.modelOutput ?? (ctx ? Math.min(8192, Math.floor(ctx / 4)) : undefined)
+    const cost = await resolveCost(args, log)
     return {
       id: args.providerId ?? "custom",
       baseURL: args.baseUrl,
@@ -456,6 +538,7 @@ async function main() {
       ...(args.providerNpm ? { npm: args.providerNpm } : {}),
       ...(ctx ? { contextLimit: ctx } : {}),
       ...(out ? { outputLimit: out } : {}),
+      ...(cost ? { cost } : {}),
     }
   })()
 

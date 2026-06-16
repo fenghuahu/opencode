@@ -101,6 +101,16 @@ function buildProviderConfig(custom: CustomProvider, modelID: string) {
       models: {
         [modelID]: {
           name: modelID,
+          ...(custom.cost
+            ? {
+                cost: {
+                  input: custom.cost.input,
+                  output: custom.cost.output,
+                  ...(custom.cost.cache_read != null ? { cache_read: custom.cost.cache_read } : {}),
+                  ...(custom.cost.cache_write != null ? { cache_write: custom.cost.cache_write } : {}),
+                },
+              }
+            : {}),
           ...(custom.contextLimit || custom.outputLimit
             ? {
                 limit: {
@@ -455,6 +465,7 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
           verbose: options.verbose ?? options.thinking ?? false,
           thinking: options.thinking ?? false,
           onStatus: status,
+          onCost: (cost) => bpm.onCost(instance.instance_id, cost),
         })
 
         const { patch, result } = await runOne({
@@ -521,7 +532,9 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
 
   // Final summary
   const totalDur = ((Date.now() - startedAt) / 1000).toFixed(1)
-  log(`> summary: ${JSON.stringify(counts)} (total ${totalDur}s, ${results.length} instance(s))`)
+  log(
+    `> summary: ${JSON.stringify(counts)} (total ${totalDur}s, ${results.length} instance(s), $${bpm.totalCost().toFixed(2)})`,
+  )
   log(`> exit-status report: ${exitStatusYamlPath}`)
 
   if (!options.keepWorkspaces) {

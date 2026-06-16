@@ -79,6 +79,40 @@ so the same workflow works with anything that speaks the OpenAI Chat
 Completions API. Override the implementation package with `--provider-npm`
 if you need a different ai-sdk adapter.
 
+## Cost (litellm-style pricing)
+
+Cost is computed the way litellm does it: the model's per-token input/output
+price is looked up in litellm's price table
+(`model_prices_and_context_window.json`) and multiplied by the token counts.
+The resolved price is handed to opencode, which does the accounting natively, so
+the per-instance and overall cost show up live in the progress widget and in the
+final `summary` line.
+
+```bash
+# Built-in / well-known model ids resolve automatically from the litellm table
+bun packages/swebench/bin/opencode-swebench \
+  --instances ./swebench_lite.jsonl --output ./predictions.jsonl \
+  --model openai/gpt-4o
+```
+
+Pricing resolution order:
+
+1. `--cost-input` / `--cost-output` (and `--cost-cache-read` / `--cost-cache-write`),
+   USD per 1M tokens — explicit manual override.
+2. `LITELLM_LOCAL_MODEL_COST_MAP=True` — force the price table bundled inside the
+   installed litellm package (no network), same env var litellm / mini-swe-agent honour.
+3. `--price-table <path|url>` — a specific litellm-format table.
+4. Default — litellm's table on GitHub, falling back to the installed litellm
+   package's bundled backup table when offline.
+
+> **Self-hosted models (vLLM, Ollama, …) are usually _not_ in the litellm table**,
+> so their cost resolves to `$0` and a `WARNING` is printed. Supply the price
+> manually to get real numbers:
+>
+> ```bash
+>   --model Qwen3-235B-A22B-FP8 --cost-input 0.5 --cost-output 1.5
+> ```
+
 ## Container mode (mini-swe-agent parity)
 
 By default the agent runs `bash` commands on the host. Pass `--container` to

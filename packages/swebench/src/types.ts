@@ -50,6 +50,16 @@ export interface CustomProvider {
   npm?: string
   /** Optional extra headers passed on every request. */
   headers?: Record<string, string>
+  /**
+   * Per-token price (USD per 1M tokens) used by opencode to compute cost,
+   * litellm-style. Resolved from a price table or --cost-* overrides.
+   */
+  cost?: {
+    input: number
+    output: number
+    cache_read?: number
+    cache_write?: number
+  }
 }
 
 export interface RunOptions {

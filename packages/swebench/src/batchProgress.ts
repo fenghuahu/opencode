@@ -50,6 +50,7 @@ export class BatchProgressManager {
   private order: string[] = []
   private finished: { id: string; exitStatus: string }[] = []
   private lastFinished: Record<string, string[]> = {}
+  private costs = new Map<string, number>()
   private out: NodeJS.WriteStream
   private interval?: ReturnType<typeof setInterval>
   private lastLines = 0
@@ -104,6 +105,18 @@ export class BatchProgressManager {
     if (e) e.status = status
   }
 
+  /** Record the running total cost (USD) for an instance. */
+  onCost(id: string, cost: number) {
+    this.costs.set(id, cost)
+  }
+
+  /** Sum of every instance's latest reported cost (USD). */
+  totalCost(): number {
+    let sum = 0
+    for (const c of this.costs.values()) sum += c
+    return sum
+  }
+
   onEnd(id: string, exitStatus: string) {
     this.active.delete(id)
     this.completed++
@@ -156,12 +169,14 @@ export class BatchProgressManager {
       .sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `${k}=${v}`)
       .join(" ")
+    const cost = this.totalCost()
 
     const lines: string[] = []
     lines.push(
       truncate(
         `${spin} Overall: ${this.completed}/${this.total} ${bar} ${(pct * 100).toFixed(0).padStart(3)}% ` +
           `• elapsed ${fmt(elapsed)} • eta ${this.completed === this.total ? "0:00" : fmt(etaSec)}` +
+          ` • $${cost.toFixed(2)}` +
           (countsStr ? ` • ${countsStr}` : ""),
         cols,
       ),

@@ -68,9 +68,11 @@ export interface ProgressOptions {
   log: (line: string) => void
   /**
    * Compact one-line status string for the live batch widget. Called frequently
-   * with the current activity ("step 3 tool=read $0.0123"). Optional.
+   * with the current activity ("step 3  $0.0123"). Optional.
    */
   onStatus?: (status: string) => void
+  /** Running total cost (USD) for this instance, reported as it accrues. */
+  onCost?: (cost: number) => void
 }
 
 export class ProgressPrinter {
@@ -85,7 +87,7 @@ export class ProgressPrinter {
 
   /** Compact widget status: only step count + running total cost. */
   private statusLine(): string {
-    return `step ${this.steps}  $${this.totalCost.toFixed(4)}`
+    return `step ${this.steps}  $${this.totalCost.toFixed(2)}`
   }
 
   /** Render a part. Called from the runner's event loop. */
@@ -113,6 +115,7 @@ export class ProgressPrinter {
       this.totalOut += tout
       this.totalReasoning += treason
       this.opts.onStatus?.(this.statusLine())
+      this.opts.onCost?.(this.totalCost)
       log(
         `${tag} ${ICONS.done} step ${this.steps} finish reason=${part.reason} ` +
           `tokens=in:${tin} out:${tout} reason:${treason} cost=$${cost.toFixed(4)} ` +
