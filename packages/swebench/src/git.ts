@@ -97,16 +97,21 @@ export async function ensureRepo(args: {
 }
 
 /**
- * Compute the unified diff between `base_commit` and the current worktree
- * (staged + unstaged + untracked). The output is the SWE-bench `model_patch`.
+ * Compute the unified diff between `base_commit` and the current worktree for
+ * TRACKED files only. This is the fallback `model_patch` used when the agent
+ * did not explicitly submit (timeout / no-submission).
+ *
+ * We deliberately do NOT `git add -A` here: a bash-only agent frequently leaves
+ * untracked junk in the worktree (`*.backup`/`*.orig` copies, reproduction
+ * scripts, scratch files), and staging everything pollutes the patch with files
+ * that are never part of a real SWE-bench fix. `git diff <base>` captures
+ * modifications and deletions of existing source files — which is what a fix
+ * consists of — while ignoring untracked noise.
  */
 export async function diffSinceBase(repoDir: string, baseCommit: string): Promise<string> {
-  // Stage everything — including new files — so a single `git diff --cached`
-  // against base_commit captures additions, modifications and deletions.
-  await exec("git", ["add", "-A"], { cwd: repoDir })
   const { stdout } = await exec(
     "git",
-    ["diff", "--no-color", "--binary", "--cached", baseCommit, "--"],
+    ["diff", "--no-color", "--binary", baseCommit, "--"],
     { cwd: repoDir },
   )
   return stdout

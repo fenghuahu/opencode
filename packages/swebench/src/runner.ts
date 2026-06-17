@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url"
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import { diffSinceBase, ensureRepo } from "./git.ts"
-import { defaultPrompt } from "./prompt.ts"
+import { defaultPrompt, miniInstancePrompt, extractSubmission, MINI_SYSTEM_PROMPT } from "./prompt.ts"
 import { spawnServer } from "./spawnServer.ts"
 import { ContainerManager, dockerAvailable } from "./container.ts"
 import { TrajectoryWriter } from "./trajectory.ts"
@@ -71,6 +71,13 @@ const DENY_INTERACTIVE = [
   { permission: "external_directory", action: "deny", pattern: "*" } as const,
 ]
 
+/**
+ * How often to poll `session.messages` for live progress while a prompt is in
+ * flight. The SSE event stream is unreliable in some environments, so this poll
+ * drives the progress widget and early submission detection.
+ */
+const POLL_INTERVAL_MS = 3_000
+
 function parseModel(
   model: string,
   custom?: CustomProvider,
@@ -135,106 +142,208 @@ async function runOne(args: {
   client: OpencodeClient
   instance: SweBenchInstance
   repoDir: string
+  mountPath?: string
   model: string
   provider?: CustomProvider
   agent: string
+  miniMode: boolean
   timeoutMs: number
   prompt: (instance: SweBenchInstance, repoDir: string) => string
   log: (line: string) => void
   traj?: TrajectoryWriter
   progress?: ProgressPrinter
 }): Promise<{ patch: string; result: RunResult }> {
-  const { client, instance, repoDir, model, provider, agent, timeoutMs, prompt, log, traj, progress } =
+  const { client, instance, repoDir, mountPath, model, provider, agent, miniMode, timeoutMs, prompt, log, traj, progress } =
     args
   const t0 = Date.now()
+
+  // In container mode the agent's bash runs inside the container at `mountPath`
+  // (e.g. /testbed), which is OUTSIDE the host session directory. opencode's
+  // `external_directory` deny would otherwise block `cd /testbed` and absolute
+  // `/testbed/...` access ("rule which prevents you from using this tool"), so
+  // explicitly allow the mount subtree. Placed AFTER the deny so it wins for the
+  // mount path (last matching rule), while other external dirs stay denied.
+  const permission = mountPath
+    ? [...DENY_INTERACTIVE, { permission: "external_directory", action: "allow", pattern: `${mountPath}/*` } as const]
+    : DENY_INTERACTIVE
 
   // 1) Create a session scoped to this worktree.
   const created = await client.session.create({
     directory: repoDir,
     title: `swebench:${instance.instance_id}`,
-    permission: DENY_INTERACTIVE,
+    permission,
   })
   const sessionID = created.data?.id
   if (!sessionID) throw new Error("session.create returned no id")
 
-  // 2) Subscribe to events BEFORE sending the prompt so we don't miss the
-  //    initial status transitions.
-  const events = await client.event.subscribe({ directory: repoDir })
+  let lastError: string | undefined
+  let lastErrorName: string | undefined
+  // mini-swe-agent parity: the agent signals completion by emitting a bash
+  // command whose stdout starts with SUBMISSION_MARKER; everything after is the
+  // patch.
+  let submission: string | undefined
 
-  // 3) Race: idle event vs timeout. Auto-approve any permission ask.
+  // Render/record a single message part, and (in mini mode) watch for the
+  // submission marker. Idempotent: a part delivered by BOTH the live SSE stream
+  // and the final prompt response is processed only once.
+  const seen = new Set<string>()
+  const handlePart = (part: any) => {
+    if (!part || (part.sessionID && part.sessionID !== sessionID)) return
+    const key = part.type === "tool" ? `${part.id}:${part.state?.status}` : part.id
+    if (key) {
+      if (seen.has(key)) return
+      seen.add(key)
+    }
+    if (traj) traj.record(part)
+    if (progress) progress.render(part)
+
+    if (
+      miniMode &&
+      submission === undefined &&
+      part.type === "tool" &&
+      part.tool === "bash" &&
+      part.state?.status === "completed" &&
+      // mini-swe-agent's _check_finished only submits when the command
+      // succeeded (returncode == 0). opencode exposes the exit code in the
+      // bash tool's completed metadata.
+      part.state.metadata?.exit === 0
+    ) {
+      const found = extractSubmission(part.state.output as string | undefined)
+      if (found !== undefined) {
+        submission = found
+        log(`[${instance.instance_id}] submission received (${found.length} bytes); stopping agent`)
+        // Fast-path: stop the agent immediately. Harmless if the stream is dead
+        // (we still detect the marker from the final prompt response below).
+        client.session.abort({ sessionID, directory: repoDir }).catch(() => {})
+      }
+    }
+  }
+
+  // 2) Subscribe to events for best-effort LIVE progress only. In some
+  //    environments the server's SSE stream does not deliver session events
+  //    reliably (it may close right after `server.connected`), so it must NOT
+  //    gate completion — the prompt response below is authoritative. The
+  //    background consumer is cancelled via `streamAbort` once we are done.
+  const streamAbort = new AbortController()
+  const consume = (async () => {
+    try {
+      const events = await client.event.subscribe({ directory: repoDir }, { signal: streamAbort.signal })
+      for await (const ev of events.stream) {
+        if (ev.type === "permission.asked") {
+          const p = ev.properties
+          if (p.sessionID === sessionID)
+            await client.permission.reply({ requestID: p.id, reply: "once", directory: repoDir }).catch(() => {})
+          continue
+        }
+        if (ev.type === "message.part.updated") {
+          if (ev.properties.part.sessionID === sessionID) handlePart(ev.properties.part)
+          continue
+        }
+        if (ev.type === "session.error") {
+          const p = ev.properties
+          if (p.sessionID !== sessionID || !p.error || submission !== undefined) continue
+          const err = p.error as { name?: string; data?: { message?: string } }
+          lastErrorName = err?.name
+          lastError = err?.data?.message ?? err?.name ?? "unknown error"
+        }
+      }
+    } catch {
+      // stream abort / transport errors are non-fatal; completion comes from the
+      // prompt response.
+    }
+  })()
+
+  // 3) Timeout: abort the session so the awaited prompt below settles.
   let timedOut = false
   const timer = setTimeout(() => {
     timedOut = true
-    // Best-effort: aborting the session lets the server clean up and
-    // pushes a terminal `session.status: idle` event so the loop exits.
     client.session.abort({ sessionID, directory: repoDir }).catch(() => {})
   }, timeoutMs)
 
-  // Kick off the prompt — fire and forget; the SSE stream is the source of truth.
-  const promptPromise = client.session
-    .prompt({
+  // 3b) Poll the message history for LIVE progress. The SSE stream is
+  //     unreliable here (see above), so without this the progress widget would
+  //     sit at "starting session" for the entire run. `handlePart` is
+  //     idempotent, so replaying the growing history every few seconds is safe;
+  //     it advances the step/cost widget and, in mini mode, lets us detect the
+  //     submission marker (and abort) before the model's turn naturally ends.
+  let polling = true
+  const poll = (async () => {
+    while (polling) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
+      if (!polling) break
+      try {
+        const msgs = await client.session.messages({ sessionID, directory: repoDir })
+        for (const m of (msgs.data as Array<{ parts?: unknown[] }> | undefined) ?? [])
+          for (const part of m.parts ?? []) handlePart(part)
+      } catch {
+        // transient; keep polling.
+      }
+    }
+  })()
+
+  // 4) Send the prompt and AWAIT it. The v2 prompt endpoint resolves with the
+  //    full assistant message + parts once the model's turn ends; this is the
+  //    authoritative completion signal and does not depend on the SSE stream.
+  try {
+    const res = await client.session.prompt({
       sessionID,
       directory: repoDir,
       agent,
       model: parseModel(model, provider),
       parts: [{ type: "text", text: prompt(instance, repoDir) }],
     })
-    .catch((e: unknown) => {
-      log(`[${instance.instance_id}] prompt error: ${(e as Error).message}`)
-    })
-
-  let lastError: string | undefined
-  let lastErrorName: string | undefined
-  try {
-    for await (const ev of events.stream) {
-      if (ev.type === "permission.asked") {
-        const p = ev.properties
-        if (p.sessionID !== sessionID) continue
-        await client.permission
-          .reply({ requestID: p.id, reply: "once", directory: repoDir })
-          .catch(() => {})
-        continue
-      }
-
-      if (ev.type === "message.part.updated") {
-        const part = ev.properties.part
-        if (part.sessionID !== sessionID) continue
-        if (traj) traj.record(part)
-        if (progress) progress.render(part)
-      }
-
-      if (ev.type === "session.error") {
-        const p = ev.properties
-        if (p.sessionID !== sessionID || !p.error) continue
-        const err = p.error as { name?: string; data?: { message?: string } }
-        lastErrorName = err?.name
-        lastError = err?.data?.message ?? err?.name ?? "unknown error"
-        log(`[${instance.instance_id}] session.error: ${lastErrorName ?? ""} ${lastError}`)
-      }
-
-      if (
-        ev.type === "session.status" &&
-        ev.properties.sessionID === sessionID &&
-        ev.properties.status.type === "idle"
-      ) {
-        break
-      }
+    if (res.error && submission === undefined && !timedOut) {
+      const err = res.error as { name?: string; data?: { message?: string } }
+      lastErrorName = err?.name ?? lastErrorName
+      lastError = err?.data?.message ?? err?.name ?? JSON.stringify(res.error)
+      log(`[${instance.instance_id}] prompt error: ${lastError}`)
+    }
+    const info = (res.data as { info?: { error?: { name?: string; data?: { message?: string } } } } | undefined)?.info
+    if (info?.error && submission === undefined && !timedOut) {
+      lastErrorName = info.error.name ?? lastErrorName
+      lastError = info.error.data?.message ?? info.error.name ?? lastError
+    }
+  } catch (e: unknown) {
+    // An abort we triggered (timeout or post-submission) surfaces here; only
+    // treat it as a real error if it was neither.
+    if (submission === undefined && !timedOut) {
+      lastError = (e as Error).message
+      log(`[${instance.instance_id}] prompt threw: ${lastError}`)
     }
   } finally {
     clearTimeout(timer)
-    await promptPromise
+    polling = false
+    streamAbort.abort()
+    await Promise.all([consume.catch(() => {}), poll.catch(() => {})])
   }
 
-  // 4) Extract the model patch directly from git — more reliable than the
-  //    snapshot-based session.diff because it covers untracked files and
-  //    matches exactly what the SWE-bench harness will apply.
-  const patch = await diffSinceBase(repoDir, instance.base_commit)
+  // 5) Reconcile from the full message history. `session.prompt` only returns
+  //    the FINAL assistant message, but a single run spans many assistant
+  //    messages (explore → edit → submit), and the SSE stream may have
+  //    delivered none of them. Fetch every message and replay its parts through
+  //    the idempotent `handlePart` so progress, trajectory, and (mini mode)
+  //    submission detection are correct regardless of stream availability.
+  await client.session
+    .messages({ sessionID, directory: repoDir })
+    .then((msgs) => {
+      for (const m of (msgs.data as Array<{ info?: { sessionID?: string }; parts?: unknown[] }> | undefined) ?? [])
+        for (const part of m.parts ?? []) handlePart(part)
+    })
+    .catch((e: unknown) => log(`[${instance.instance_id}] messages fetch failed: ${(e as Error).message}`))
+
+
+  // 4) Resolve the model patch. In mini mode, prefer the explicit submission
+  //    (the agent's own `git diff`). Otherwise — or if the agent never
+  //    submitted — fall back to a host-side `git diff` against base_commit,
+  //    which also covers the native `build` agent's file-tool edits.
+  const patch =
+    submission !== undefined ? submission : await diffSinceBase(repoDir, instance.base_commit)
   const duration = Date.now() - t0
 
   // Status uses mini-swe-agent's `info.exit_status` vocabulary so the
   // exit_statuses_*.yaml report and per-instance traj.json files match what
   // mini-extra inspector / sb-cli expect.
-  const status = classifyExitStatus({ timedOut, patch, lastError, lastErrorName })
+  const status = classifyExitStatus({ submitted: submission !== undefined, timedOut, patch, lastError, lastErrorName })
 
   return {
     patch,
@@ -272,7 +381,11 @@ async function pool<T>(
 
 export async function run(options: RunOptions): Promise<RunResult[]> {
   const rawLog = options.log ?? ((l) => console.log(l))
-  const prompt = options.promptTemplate ?? defaultPrompt
+  // Default to the bash-only "swebench" agent (mini-swe-agent style). Pass
+  // `--agent build` to use opencode's native multi-tool agent instead.
+  const agentName = options.agent ?? "swebench"
+  const miniMode = agentName === "swebench"
+  const prompt = options.promptTemplate ?? (miniMode ? miniInstancePrompt : defaultPrompt)
 
   await mkdir(path.dirname(path.resolve(options.output)), { recursive: true })
 
@@ -294,6 +407,11 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
   log(
     `> opencode-swebench: ${options.instances.length} instance(s), concurrency=${options.concurrency}, model=${options.model}`,
   )
+  log(
+    miniMode
+      ? `> agent: swebench (mini-swe-agent style: bash-only, explicit ${"COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"} submission)`
+      : `> agent: ${agentName} (opencode native multi-tool; patch via host git diff)`,
+  )
 
   // Validate model up-front so we fail fast before spawning a server.
   const parsed = parseModel(options.model, options.provider)
@@ -309,6 +427,20 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
     ...(options.provider
       ? { provider: buildProviderConfig(options.provider, parsed.modelID) }
       : {}),
+    // Bash-only "swebench" agent (mini-swe-agent parity): replace opencode's
+    // built-in system prompt with the mini-style shell prompt, and deny every
+    // tool except `bash` so the model edits exclusively through the shell.
+    ...(miniMode
+      ? {
+          agent: {
+            swebench: {
+              mode: "primary",
+              prompt: MINI_SYSTEM_PROMPT,
+              permission: { "*": "deny", bash: "allow" },
+            },
+          },
+        }
+      : {}),
   }
 
   // Container mode (mini-swe-agent parity): route every agent shell command
@@ -317,6 +449,21 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
   // and `git diff` keep operating on the bind-mounted host worktree.
   let containers: ContainerManager | undefined
   if (options.container) {
+    if (!miniMode) {
+      // Incompatible combination: a multi-tool agent's read/grep/glob/edit tools
+      // emit HOST paths (`<workspaceRoot>/<instance>/...`), but bash runs INSIDE
+      // the container where only the mount path (`/testbed`) exists. The model
+      // copies host paths into bash → "No such file", and the correct `/testbed`
+      // path is blocked by the external_directory deny rule → it thrashes and
+      // edits via failing bash instead of the (host) edit tool → empty patches.
+      // The bash-only `swebench` agent has a single consistent namespace.
+      log(
+        `> WARNING: --agent ${agentName} with --container mixes host-path tools and in-container bash, ` +
+          `which confuses the model (host paths fail in the container; /testbed is permission-denied) ` +
+          `and commonly yields empty patches. Use the default bash-only "swebench" agent WITH --container, ` +
+          `or run --agent ${agentName} WITHOUT --container (host clone; the grader re-applies your patch in the image anyway).`,
+      )
+    }
     if (!(await dockerAvailable())) {
       throw new Error(
         "--container requires a docker/podman-compatible CLI on PATH, but none was found.",
@@ -446,14 +593,21 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
 
         vlog(`${tag} running agent (timeout=${options.timeoutMs}ms)`)
         status("starting session")
-        const promptText = prompt(instance, repoDir)
+        // In container mode the agent's bash runs INSIDE the container at the
+        // mount path (e.g. /testbed), not at the host worktree path. The prompt
+        // must therefore describe the CONTAINER path so the model's `cd`, paths
+        // and submission `git diff` all target where its shell actually runs.
+        // The host `repoDir` is still used for the session directory and the
+        // host-side `git diff` fallback (same files via the bind mount).
+        const promptDir = container ? container.mount : repoDir
+        const promptText = prompt(instance, promptDir)
         const traj = options.trajDir
           ? new TrajectoryWriter({
               dir: options.trajDir,
               instance,
               model: options.model,
               providerId: options.provider?.id,
-              agent: options.agent ?? "build",
+              agent: agentName,
               prompt: promptText,
             })
           : undefined
@@ -472,9 +626,11 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
           client,
           instance,
           repoDir,
+          mountPath: container?.mount,
           model: options.model,
           provider: options.provider,
-          agent: options.agent ?? "build",
+          agent: agentName,
+          miniMode,
           timeoutMs: options.timeoutMs,
           prompt: () => promptText,
           log,
@@ -570,11 +726,14 @@ function formatDuration(sec: number): string {
  * downstream tooling stack can read both harnesses' reports.
  */
 function classifyExitStatus(args: {
+  submitted: boolean
   timedOut: boolean
   patch: string
   lastError?: string
   lastErrorName?: string
 }): string {
+  // An explicit submission wins over everything: the agent declared itself done.
+  if (args.submitted) return args.patch.trim() ? "Submitted" : "EmptyPatch"
   if (args.timedOut) return "TimeoutError"
   if (args.lastErrorName) {
     if (args.lastErrorName === "ContextOverflowError") return "ContextWindowExceededError"

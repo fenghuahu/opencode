@@ -552,6 +552,22 @@
         "vite": "catalog:",
       },
     },
+    "packages/swebench": {
+      "name": "@opencode-ai/swebench",
+      "version": "0.1.0",
+      "bin": {
+        "opencode-swebench": "./bin/opencode-swebench",
+      },
+      "dependencies": {
+        "@opencode-ai/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "@tsconfig/bun": "catalog:",
+        "@types/bun": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "typescript": "catalog:",
+      },
+    },
     "packages/ui": {
       "name": "@opencode-ai/ui",
       "version": "1.14.40",
@@ -1556,6 +1572,8 @@
     "@opencode-ai/slack": ["@opencode-ai/slack@workspace:packages/slack"],
 
     "@opencode-ai/storybook": ["@opencode-ai/storybook@workspace:packages/storybook"],
+
+    "@opencode-ai/swebench": ["@opencode-ai/swebench@workspace:packages/swebench"],
 
     "@opencode-ai/ui": ["@opencode-ai/ui@workspace:packages/ui"],
 
