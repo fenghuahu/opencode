@@ -184,7 +184,7 @@ opencode server:
 
 Execution:
   --workers, -w <n>          Parallel instances. Default: 1. Alias: --concurrency.
-  --timeout-ms <n>            Per-instance wall-clock timeout. Default: 600000
+  --timeout-ms <n>            Per-instance wall-clock timeout. Default: 900000
   --workspace-root <dir>     Where to clone per-instance worktrees. Default: ./.swebench-work
   --agent <name>             opencode primary agent. Default: swebench
                              swebench = mini-swe-agent style (bash-only, the model edits
@@ -261,7 +261,7 @@ function parseArgs(argv: string[]): Args {
   const out: Partial<Args> = {
     workspaceRoot: path.resolve(".swebench-work"),
     concurrency: 1,
-    timeoutMs: 600_000,
+    timeoutMs: 900_000,
     keepWorkspaces: true,
     agent: "swebench",
   }

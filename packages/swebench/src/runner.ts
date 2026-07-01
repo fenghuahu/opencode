@@ -157,20 +157,25 @@ async function runOne(args: {
     args
   const t0 = Date.now()
 
-  // In container mode the agent's bash runs inside the container at `mountPath`
-  // (e.g. /testbed), which is OUTSIDE the host session directory. opencode's
-  // `external_directory` deny would otherwise block `cd /testbed` and absolute
-  // `/testbed/...` access ("rule which prevents you from using this tool"), so
-  // explicitly allow the mount subtree. Placed AFTER the deny so it wins for the
-  // mount path (last matching rule), while other external dirs stay denied.
-  const permission = mountPath
-    ? [...DENY_INTERACTIVE, { permission: "external_directory", action: "allow", pattern: `${mountPath}/*` } as const]
-    : DENY_INTERACTIVE
+  // In container mode the agent's bash runs inside the container, so it may
+  // freely access ANY path (e.g. /testbed, /tmp, /root, /usr). Replace the
+  // blanket external_directory deny with a blanket allow; the container is fully
+  // isolated so there is no host-filesystem risk.
+  const DENY_INTERACTIVE_CONTAINER = [
+    { permission: "question", action: "deny", pattern: "*" } as const,
+    { permission: "plan_enter", action: "deny", pattern: "*" } as const,
+    { permission: "plan_exit", action: "deny", pattern: "*" } as const,
+    { permission: "external_directory", action: "allow", pattern: "*" } as const,
+  ]
+  const permission = mountPath ? DENY_INTERACTIVE_CONTAINER : DENY_INTERACTIVE
+  const parsedModel = parseModel(model, provider)
 
   // 1) Create a session scoped to this worktree.
   const created = await client.session.create({
     directory: repoDir,
     title: `swebench:${instance.instance_id}`,
+    agent,
+    model: { id: parsedModel.modelID, providerID: parsedModel.providerID },
     permission,
   })
   const sessionID = created.data?.id
@@ -285,12 +290,10 @@ async function runOne(args: {
   //    full assistant message + parts once the model's turn ends; this is the
   //    authoritative completion signal and does not depend on the SSE stream.
   try {
-    const res = await client.session.prompt({
+    const res = await client.v2.session.prompt({
       sessionID,
       directory: repoDir,
-      agent,
-      model: parseModel(model, provider),
-      parts: [{ type: "text", text: prompt(instance, repoDir) }],
+      prompt: { text: prompt(instance, repoDir) },
     })
     if (res.error && submission === undefined && !timedOut) {
       const err = res.error as { name?: string; data?: { message?: string } }
@@ -317,7 +320,8 @@ async function runOne(args: {
     await Promise.all([consume.catch(() => {}), poll.catch(() => {})])
   }
 
-  // 5) Reconcile from the full message history. `session.prompt` only returns
+  // 5) Reconcile from the full message history. `v2.session.prompt` only
+  //    returns
   //    the FINAL assistant message, but a single run spans many assistant
   //    messages (explore → edit → submit), and the SSE stream may have
   //    delivered none of them. Fetch every message and replay its parts through
@@ -332,12 +336,19 @@ async function runOne(args: {
     .catch((e: unknown) => log(`[${instance.instance_id}] messages fetch failed: ${(e as Error).message}`))
 
 
-  // 4) Resolve the model patch. In mini mode, prefer the explicit submission
-  //    (the agent's own `git diff`). Otherwise — or if the agent never
-  //    submitted — fall back to a host-side `git diff` against base_commit,
-  //    which also covers the native `build` agent's file-tool edits.
-  const patch =
-    submission !== undefined ? submission : await diffSinceBase(repoDir, instance.base_commit)
+  // 4) Resolve the model patch.
+  //    - Primary: host-side `git diff` against base_commit. This is always
+  //      authoritative for both container mode (bind-mounted worktree) and
+  //      non-container mode. Captures the actual final state of the files.
+  //    - Fallback: the explicit submission content (the model's `cat patch.txt`
+  //      output). Used only when the host diff is empty — e.g. the model
+  //      reverted its edits and the submission contained an older snapshot.
+  //    This avoids the common failure where the model runs just
+  //    `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` (no `cat patch.txt`),
+  //    which sets `submission = ""` and previously produced an EmptyPatch even
+  //    though the host worktree had real changes.
+  const hostPatch = await diffSinceBase(repoDir, instance.base_commit)
+  const patch = hostPatch.trim() ? hostPatch : (submission ?? "")
   const duration = Date.now() - t0
 
   // Status uses mini-swe-agent's `info.exit_status` vocabulary so the
@@ -735,6 +746,12 @@ function classifyExitStatus(args: {
   // An explicit submission wins over everything: the agent declared itself done.
   if (args.submitted) return args.patch.trim() ? "Submitted" : "EmptyPatch"
   if (args.timedOut) return "TimeoutError"
+  // A non-empty host-side patch means the agent made real edits — submit them
+  // even if the session also emitted an error (context overflow, internal error,
+  // etc.). The harness only cares about the patch content, and partial fixes can
+  // still score points. Error classification is only used when there's nothing
+  // to submit.
+  if (args.patch.trim()) return "Submitted"
   if (args.lastErrorName) {
     if (args.lastErrorName === "ContextOverflowError") return "ContextWindowExceededError"
     if (args.lastErrorName === "MessageOutputLengthError") return "LimitsExceeded"
