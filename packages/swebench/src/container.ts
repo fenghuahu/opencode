@@ -100,7 +100,10 @@ if [ -z "$best_container" ]; then
   exec /bin/bash -c "$cmd"
 fi
 rel=\${cwd#"$best_host"}
-exec ${DOCKER} exec -w "$best_mount$rel" "$best_container" /bin/bash -c "$cmd"
+# Use a login shell (-lc) so the image's conda environment (e.g. the SWE-bench
+# "testbed" env holding the project + its compiled deps) is activated. A plain
+# -c shell resolves to the base env and fails to import the project package.
+exec ${DOCKER} exec -w "$best_mount$rel" "$best_container" /bin/bash -lc "$cmd"
 `
 }
 
@@ -213,6 +216,24 @@ export class ContainerManager {
     ])
     this.active.add(name)
     await this.register(hostRepoDir, name, mount)
+
+    // 6) Mirror the host worktree path inside the container as a symlink to the
+    //    mount. opencode injects the HOST path as the model's "Working directory"
+    //    (the <env> block in the system prompt), so the model frequently `cd`s or
+    //    `find`s that absolute path. Without this it fails ("No such file or
+    //    directory") inside the container and wastes turns or gives up. The
+    //    symlink makes the leaked host path resolve to /testbed inside the
+    //    container, so either path works transparently.
+    if (hostRepoDir !== mount) {
+      const q = (s: string) => `'${s.replaceAll("'", "'\\''")}'`
+      await exec(DOCKER, [
+        "exec",
+        name,
+        "sh",
+        "-c",
+        `mkdir -p ${q(path.posix.dirname(hostRepoDir))} && ln -sfn ${q(mount)} ${q(hostRepoDir)}`,
+      ]).catch(() => {})
+    }
 
     return {
       name,

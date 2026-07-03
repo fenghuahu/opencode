@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { mkdir, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { run } from "./runner.ts"
 import {
@@ -10,6 +11,23 @@ import {
 } from "./dataset.ts"
 import type { SweBenchInstance } from "./types.ts"
 import { loadPriceTable, lookupPrice, type ModelPrice } from "./pricing.ts"
+
+type CliErrorCode =
+  | "E_INSTANCES_NOT_FOUND"
+  | "E_INSTANCES_EMPTY"
+  | "E_INSTANCES_SCHEMA"
+  | "E_INSTANCES_PARSE"
+  | "E_WORKSPACE_NOT_WRITABLE"
+
+class CliError extends Error {
+  constructor(
+    readonly code: CliErrorCode,
+    message: string,
+  ) {
+    super(message)
+    this.name = "CliError"
+  }
+}
 
 /**
  * Bun 1.3 caches HTTP proxy configuration at process startup, so neither
@@ -52,6 +70,11 @@ if (maybeReexecWithoutProxy()) {
   // Re-exec in progress; the child process will do all the work.
 } else {
   main().catch((e) => {
+    if (e instanceof CliError) {
+      console.error(`[${e.code}] ${e.message}`)
+      console.error(JSON.stringify({ error_code: e.code, error: e.message }))
+      process.exit(2)
+    }
     console.error(e)
     process.exit(1)
   })
@@ -93,6 +116,60 @@ interface Args {
   progress?: boolean
   container?: boolean
   containerImage?: string
+}
+
+function requireInstanceFields(instances: SweBenchInstance[], source: string) {
+  if (instances.length === 0) {
+    throw new CliError("E_INSTANCES_EMPTY", `instances file is empty: ${source}`)
+  }
+  for (const [idx, inst] of instances.slice(0, 20).entries()) {
+    const missing = ["instance_id", "repo", "base_commit", "problem_statement"].filter((k) => {
+      const v = (inst as Record<string, unknown>)[k]
+      return typeof v !== "string" || v.trim() === ""
+    })
+    if (missing.length > 0) {
+      throw new CliError(
+        "E_INSTANCES_SCHEMA",
+        `${source}: invalid instance at index ${idx} (missing/empty: ${missing.join(", ")})`,
+      )
+    }
+  }
+}
+
+async function ensureWorkspaceRootReady(dir: string, log: (s: string) => void) {
+  try {
+    await mkdir(dir, { recursive: true })
+    const probe = path.join(dir, `.opencode-swebench-write-probe-${process.pid}-${Date.now()}`)
+    await writeFile(probe, "ok")
+    await rm(probe, { force: true })
+  } catch (e) {
+    throw new CliError(
+      "E_WORKSPACE_NOT_WRITABLE",
+      `workspace-root is not writable: ${dir} (${(e as Error).message})`,
+    )
+  }
+  log(`> workspace-root ready: ${dir}`)
+}
+
+async function preflight(args: Args, log: (s: string) => void) {
+  if (args.instances) {
+    const p = path.resolve(args.instances)
+    const st = await stat(p).catch(() => undefined)
+    if (!st?.isFile()) {
+      throw new CliError("E_INSTANCES_NOT_FOUND", `--instances file not found: ${p}`)
+    }
+    if (st.size === 0) {
+      throw new CliError("E_INSTANCES_EMPTY", `--instances file is empty: ${p}`)
+    }
+    log(`> instances file ready: ${p} (${st.size} bytes)`)
+  }
+  if (args.timeoutMs >= 1_200_000) {
+    log(
+      `> timeout-ms=${args.timeoutMs}: higher timeout helps only for genuinely long tasks, ` +
+        `not for stuck startup/network steps.`,
+    )
+  }
+  await ensureWorkspaceRootReady(args.workspaceRoot, log)
 }
 
 function usage(): never {
@@ -443,8 +520,17 @@ async function loadInstances(args: Args, log: (s: string) => void): Promise<SweB
   if (args.subset) {
     return loadSubset(args.subset, args.split ?? "dev", log)
   }
-  log(`> loading instances from ${args.instances}`)
-  return loadFromFile(args.instances!)
+  const source = path.resolve(args.instances!)
+  log(`> loading instances from ${source}`)
+  const instances = await loadFromFile(source).catch((e: unknown) => {
+    throw new CliError(
+      "E_INSTANCES_PARSE",
+      `${source}: failed to parse instances file (${(e as Error).message})`,
+    )
+  })
+  requireInstanceFields(instances, source)
+  log(`> instances schema check passed (${instances.length} row(s))`)
+  return instances
 }
 
 function resolveTrajDir(value: string | undefined): string | undefined {
@@ -490,6 +576,13 @@ async function resolveCost(args: Args, log: (s: string) => void): Promise<ModelP
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   const log = (s: string) => console.log(s)
+  await preflight(args, log)
+
+  if (!args.instances) {
+    log(
+      `> NOTE: --subset may depend on network. For reproducible/offline runs prefer --instances <local.jsonl>.`,
+    )
+  }
 
   let instances = await loadInstances(args, log)
   const total = instances.length
