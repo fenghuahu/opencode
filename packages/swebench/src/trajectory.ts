@@ -91,9 +91,8 @@ interface Trajectory {
   trajectory_format: "mini-swe-agent-1.1"
 }
 
-const SYSTEM_MESSAGE =
-  "opencode SWE-bench harness. Agent has access to bash, read, edit, write, glob, grep, webfetch and task tools. " +
-  "Edits are persisted to the repository working tree; the harness collects the resulting diff against the base commit as the submission."
+const DEFAULT_SYSTEM_MESSAGE =
+  "You are a helpful assistant that can interact with a computer shell to solve programming tasks."
 
 export class TrajectoryWriter {
   readonly path: string
@@ -116,6 +115,7 @@ export class TrajectoryWriter {
     providerId?: string
     agent: string
     prompt: string
+    systemPrompt?: string
   }) {
     const id = args.instance.instance_id
     // mini-swe-agent layout: <output_dir>/<instance_id>/<instance_id>.traj.json
@@ -152,7 +152,7 @@ export class TrajectoryWriter {
         },
       },
       messages: [
-        { role: "system", content: SYSTEM_MESSAGE },
+        { role: "system", content: args.systemPrompt ?? DEFAULT_SYSTEM_MESSAGE },
         { role: "user", content: args.prompt, extra: { timestamp: nowSec() } },
       ],
       trajectory_format: "mini-swe-agent-1.1",

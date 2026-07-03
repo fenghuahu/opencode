@@ -290,7 +290,7 @@ async function runOne(args: {
       directory: repoDir,
       agent,
       model: parseModel(model, provider),
-      parts: [{ type: "text", text: prompt(instance, repoDir) }],
+      parts: [{ type: "text", text: prompt(instance, mountPath ?? repoDir) }],
     })
     if (res.error && submission === undefined && !timedOut) {
       const err = res.error as { name?: string; data?: { message?: string } }
@@ -609,6 +609,7 @@ export async function run(options: RunOptions): Promise<RunResult[]> {
               providerId: options.provider?.id,
               agent: agentName,
               prompt: promptText,
+              ...(miniMode ? { systemPrompt: MINI_SYSTEM_PROMPT } : {}),
             })
           : undefined
         if (traj) vlog(`${tag} trajectory -> ${traj.path}`)

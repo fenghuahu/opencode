@@ -23,7 +23,6 @@ export const SUBMISSION_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
  */
 export const MINI_SYSTEM_PROMPT =
   "You are a helpful assistant that can interact with a computer shell to solve programming tasks."
-
 /**
  * Instance prompt for the bash-only agent. Reproduced from mini-swe-agent
  * 2.2.7's `config/benchmarks/swebench.yaml` `instance_template`, with two
